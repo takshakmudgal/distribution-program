@@ -2,134 +2,206 @@ import * as anchor from "@project-serum/anchor";
 import { Program } from "@project-serum/anchor";
 import { DistributionProgram } from "../target/types/distribution_program";
 import { assert } from "chai";
-import { SystemProgram, Transaction, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 describe("distribution-program", () => {
-  // Configure the client to use the local cluster.
   anchor.setProvider(anchor.AnchorProvider.env());
 
   const program = anchor.workspace
     .DistributionProgram as Program<DistributionProgram>;
   const provider = anchor.AnchorProvider.env();
 
-  let sender = anchor.web3.Keypair.generate();
-  let recipient = new anchor.web3.PublicKey(
-    "81WqD2Aam245VkFYQGpKD9AmSKWtv5ad6YwkMvqoRQx9"
-  );
+  const authority = anchor.web3.Keypair.generate();
+  const depositor = anchor.web3.Keypair.generate();
+  const recipient = anchor.web3.Keypair.generate();
 
-  it("sending sol to the main sender", async () => {
-    const airdropSignature = await provider.connection.requestAirdrop(
-      sender.publicKey,
-      anchor.web3.LAMPORTS_PER_SOL
+  let treasury;
+  let treasuryAccount;
+  let treasuryBump;
+
+  before(async () => {
+    const authorityAirdrop = await provider.connection.requestAirdrop(
+      authority.publicKey,
+      2 * anchor.web3.LAMPORTS_PER_SOL
     );
-    await provider.connection.confirmTransaction(airdropSignature);
+    await provider.connection.confirmTransaction(authorityAirdrop);
+
+    const depositorAirdrop = await provider.connection.requestAirdrop(
+      depositor.publicKey,
+      2 * anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(depositorAirdrop);
+
+    [treasury, treasuryBump] = await PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury"), authority.publicKey.toBuffer()],
+      program.programId
+    );
+
+    [treasuryAccount] = await PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury"), authority.publicKey.toBuffer()],
+      program.programId
+    );
+
+    console.log("Authority:", authority.publicKey.toString());
+    console.log("Treasury:", treasury.toString());
+    console.log("Treasury Account:", treasuryAccount.toString());
+    console.log("Recipient:", recipient.publicKey.toString());
   });
 
-  it("Transfers SOL directly using SystemProgram", async () => {
-    // Use a small amount for the test
-    const amount = 10000; // 0.00001 SOL
-
-    // Get initial balances
-    const initialRecipientBalance = await provider.connection.getBalance(
-      recipient
-    );
-    const initialSenderBalance = await provider.connection.getBalance(
-      sender.publicKey
-    );
-
-    console.log("Initial recipient balance:", initialRecipientBalance);
-    console.log("Initial sender balance:", initialSenderBalance);
-    console.log("Transfer amount:", amount);
-
+  it("Initializes a treasury", async () => {
     try {
-      // Create a direct transfer instruction using SystemProgram
-      const transferInstruction = SystemProgram.transfer({
-        fromPubkey: sender.publicKey,
-        toPubkey: recipient,
-        lamports: amount,
-      });
+      const tx = await program.methods
+        .initializeTreasury()
+        .accounts({
+          authority: authority.publicKey,
+          treasury: treasury,
+          treasuryAccount: treasuryAccount,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([authority])
+        .rpc();
 
-      // Create and send the transaction
-      const transaction = new Transaction().add(transferInstruction);
-      const signature = await provider.connection.sendTransaction(transaction, [
-        sender,
-      ]);
+      console.log("Initialize treasury transaction signature:", tx);
 
-      // Wait for confirmation
-      await provider.connection.confirmTransaction(signature);
-
-      console.log("Direct transfer transaction signature:", signature);
-
-      // Verify the balance changes
-      const finalRecipientBalance = await provider.connection.getBalance(
-        recipient
+      const treasuryData = await program.account.treasury.fetch(treasury);
+      assert.equal(
+        treasuryData.authority.toString(),
+        authority.publicKey.toString(),
+        "Treasury authority should match"
       );
-      const finalSenderBalance = await provider.connection.getBalance(
-        sender.publicKey
-      );
-
-      console.log("Final recipient balance:", finalRecipientBalance);
-      console.log("Final sender balance:", finalSenderBalance);
-
-      assert(
-        finalRecipientBalance > initialRecipientBalance,
-        "Recipient balance should have increased"
+      assert.equal(
+        treasuryData.bump,
+        treasuryBump,
+        "Treasury bump should match"
       );
     } catch (error) {
-      console.error("Direct transfer failed:", error);
+      console.error("Initialize treasury failed:", error);
       throw error;
     }
   });
 
-  it("Attempts to use program with direct serialization", async () => {
-    const amount = new anchor.BN(10000);
+  it("Deposits SOL into the treasury", async () => {
+    const initialTreasuryBalance = await provider.connection.getBalance(
+      treasuryAccount
+    );
+    console.log("Initial treasury balance:", initialTreasuryBalance);
+
+    const depositAmount = new anchor.BN(0.5 * anchor.web3.LAMPORTS_PER_SOL);
 
     try {
-      console.log("Attempting program call with direct instruction creation");
-
-      // Generate the correct instruction to extract the discriminator
-      const ix = await program.methods
-        .distribute(amount)
+      const tx = await program.methods
+        .deposit(depositAmount)
         .accounts({
-          from: sender.publicKey,
-          to: recipient,
-          systemProgram: SystemProgram.programId,
+          depositor: depositor.publicKey,
+          treasuryAccount: treasuryAccount,
+          treasury: treasury,
+          systemProgram: anchor.web3.SystemProgram.programId,
         })
-        .instruction();
-      const discriminator = ix.data.subarray(0, 8);
+        .signers([depositor])
+        .rpc();
 
-      // Create the data buffer with discriminator and amount
-      const dataLayout = anchor.Borsh.struct([anchor.Borsh.u64("amount")]);
-      const dataWithoutDiscriminator = Buffer.alloc(8);
-      dataLayout.encode({ amount: amount }, dataWithoutDiscriminator);
-      const data = Buffer.concat([discriminator, dataWithoutDiscriminator]);
+      console.log("Deposit transaction signature:", tx);
 
-      console.log("Instruction data buffer:", data);
+      const finalTreasuryBalance = await provider.connection.getBalance(
+        treasuryAccount
+      );
+      console.log("Final treasury balance:", finalTreasuryBalance);
 
-      // Create the instruction manually
-      const keys = [
-        { pubkey: sender.publicKey, isWritable: true, isSigner: true },
-        { pubkey: recipient, isWritable: true, isSigner: false },
-        { pubkey: SystemProgram.programId, isWritable: false, isSigner: false },
-      ];
-
-      const instruction = {
-        programId: program.programId,
-        keys,
-        data,
-      };
-
-      // Send the transaction
-      const transaction = new Transaction().add(instruction);
-      const signature = await provider.connection.sendTransaction(transaction, [
-        sender,
-      ]);
-
-      console.log("Program transaction signature:", signature);
-      await provider.connection.confirmTransaction(signature);
+      assert(
+        finalTreasuryBalance > initialTreasuryBalance,
+        "Treasury balance should have increased"
+      );
+      assert.equal(
+        finalTreasuryBalance - initialTreasuryBalance,
+        depositAmount.toNumber(),
+        "Treasury balance should have increased by the deposit amount"
+      );
     } catch (error) {
-      console.error("Program call failed:", error);
-      console.error("Error details:", error.logs || "No logs available");
+      console.error("Deposit failed:", error);
+      throw error;
     }
+  });
+
+  it("Distributes SOL from the treasury", async () => {
+    const initialTreasuryBalance = await provider.connection.getBalance(
+      treasuryAccount
+    );
+    const initialRecipientBalance = await provider.connection.getBalance(
+      recipient.publicKey
+    );
+
+    console.log("Initial treasury balance:", initialTreasuryBalance);
+    console.log("Initial recipient balance:", initialRecipientBalance);
+
+    const distributeAmount = new anchor.BN(0.1 * anchor.web3.LAMPORTS_PER_SOL);
+
+    try {
+      const tx = await program.methods
+        .distribute(distributeAmount, recipient.publicKey)
+        .accounts({
+          authority: authority.publicKey,
+          treasuryAccount: treasuryAccount,
+          treasury: treasury,
+          recipient: recipient.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([authority])
+        .rpc();
+
+      console.log("Distribute transaction signature:", tx);
+
+      const finalTreasuryBalance = await provider.connection.getBalance(
+        treasuryAccount
+      );
+      const finalRecipientBalance = await provider.connection.getBalance(
+        recipient.publicKey
+      );
+
+      console.log("Final treasury balance:", finalTreasuryBalance);
+      console.log("Final recipient balance:", finalRecipientBalance);
+
+      assert.equal(
+        initialTreasuryBalance - finalTreasuryBalance,
+        distributeAmount.toNumber(),
+        "Treasury balance should have decreased by the distribute amount"
+      );
+
+      assert.equal(
+        finalRecipientBalance - initialRecipientBalance,
+        distributeAmount.toNumber(),
+        "Recipient balance should have increased by the distribute amount"
+      );
+    } catch (error) {
+      console.error("Distribution failed:", error);
+      throw error;
+    }
+  });
+
+  it("Fails to distribute if not the authority", async () => {
+    let failed = false;
+    const distributeAmount = new anchor.BN(0.1 * anchor.web3.LAMPORTS_PER_SOL);
+
+    try {
+      await program.methods
+        .distribute(distributeAmount, recipient.publicKey)
+        .accounts({
+          authority: depositor.publicKey,
+          treasuryAccount: treasuryAccount,
+          treasury: treasury,
+          recipient: recipient.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([depositor])
+        .rpc();
+
+      console.log("This should have failed but didn't!");
+    } catch (error) {
+      failed = true;
+      console.log(
+        "Failed as expected when unauthorized user tries to distribute"
+      );
+    }
+
+    assert(failed, "Transaction should have failed with unauthorized error");
   });
 });
